@@ -95,6 +95,10 @@ pub struct SymbolDb<'data, P: Platform> {
     /// The name of the entry symbol if overridden by a linker script.
     entry: Option<&'data [u8]>,
 
+    /// Symbols referenced as hidden but undefined in their referring regular object. If these
+    /// later resolve to local definitions, they should remain local and not be exported.
+    hidden_undefined_names: Vec<PreHashed<UnversionedSymbolName<'data>>>,
+
     pub(crate) output_kind: OutputKind,
     pub(crate) herd: &'data bumpalo_herd::Herd,
 }
@@ -276,6 +280,8 @@ impl Iterator for SymbolIdRangeIterator {
 struct SymbolLoadOutputs<'data> {
     /// Pending non-versioned symbols, grouped by hash bucket.
     pending_symbols_by_bucket: Vec<PendingSymbolHashBucket<'data>>,
+
+    hidden_undefined_names: Vec<PreHashed<UnversionedSymbolName<'data>>>,
 }
 
 #[derive(Default, Clone)]
@@ -356,6 +362,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             version_script,
             export_list,
             entry: None,
+            hidden_undefined_names: Vec::new(),
             output_kind,
             herd,
         };
@@ -431,6 +438,11 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         )?;
 
         populate_symbol_db(&mut self.buckets, &per_group_outputs);
+
+        for outputs in &per_group_outputs {
+            self.hidden_undefined_names
+                .extend_from_slice(&outputs.hidden_undefined_names);
+        }
 
         {
             verbose_timing_phase!("Return shards");
@@ -1163,6 +1175,16 @@ pub(crate) fn resolve_alternative_symbol_definitions<'data, P: Platform>(
 
     symbol_db.buckets = buckets;
 
+    for name in &symbol_db.hidden_undefined_names {
+        let Some(symbol_id) = symbol_db.get_unversioned(name) else {
+            continue;
+        };
+        let definition_id = symbol_db.definition(symbol_id);
+        atomic_per_symbol_flags
+            .get_atomic(definition_id)
+            .or_assign(ValueFlags::NON_INTERPOSABLE | ValueFlags::DOWNGRADE_TO_LOCAL);
+    }
+
     Ok(())
 }
 
@@ -1210,10 +1232,10 @@ fn process_alternatives<'data, P: Platform>(
                 }
 
                 if visibility != Visibility::Default {
-                    handle_non_default_visibility(per_symbol_flags, first);
+                    handle_non_default_visibility(per_symbol_flags, first, visibility);
 
                     for alt in alternatives {
-                        handle_non_default_visibility(per_symbol_flags, alt);
+                        handle_non_default_visibility(per_symbol_flags, alt, visibility);
                     }
                 }
             }
@@ -1226,13 +1248,23 @@ fn process_alternatives<'data, P: Platform>(
 
 /// Update value flags for `symbol_id` given that we've now changed its visibility to something
 /// other than default.
-fn handle_non_default_visibility(per_symbol_flags: &AtomicPerSymbolFlags, symbol_id: SymbolId) {
-    // TODO: Currently we only make the symbol non-interposable, but we should also actually
-    // change its visibility too. We need somewhere to store this information. We also need
-    // linker-diff to report when we get exported dynamic symbols wrong.
+fn handle_non_default_visibility(
+    per_symbol_flags: &AtomicPerSymbolFlags,
+    symbol_id: SymbolId,
+    visibility: Visibility,
+) {
     let flags = per_symbol_flags.get_atomic(symbol_id);
-    if !flags.get().contains(ValueFlags::DYNAMIC) {
-        flags.or_assign(ValueFlags::NON_INTERPOSABLE);
+    match visibility {
+        Visibility::Hidden => {
+            // Hidden merged visibility must localize the symbol so it cannot leak into dynsym.
+            flags.or_assign(ValueFlags::NON_INTERPOSABLE | ValueFlags::DOWNGRADE_TO_LOCAL);
+        }
+        Visibility::Protected => {
+            if !flags.get().contains(ValueFlags::DYNAMIC) {
+                flags.or_assign(ValueFlags::NON_INTERPOSABLE);
+            }
+        }
+        Visibility::Default => {}
     }
 }
 
@@ -1427,6 +1459,7 @@ fn read_symbols_for_group<'data, P: Platform>(
 
     let mut outputs = SymbolLoadOutputs {
         pending_symbols_by_bucket: vec![PendingSymbolHashBucket::default(); num_buckets],
+        hidden_undefined_names: Vec::new(),
     };
 
     match shard.group {
@@ -1606,15 +1639,23 @@ trait SymbolLoader<'data, P: Platform> {
         for symbol in self.object().symbols_iter() {
             let symbol_id = symbols_out.next;
             let mut flags = self.compute_value_flags(symbol);
+            let local_index = symbol_id.offset_from(base_symbol_id);
 
             if symbol.is_undefined() || self.should_ignore_symbol(symbol) {
+                if symbol.is_undefined()
+                    && !self.object().is_dynamic()
+                    && !symbol.is_interposable()
+                    && !symbol.is_local()
+                {
+                    let info = self.get_symbol_name_and_version(symbol, local_index)?;
+                    outputs
+                        .add_hidden_undefined_name(UnversionedSymbolName::prehashed(info.name()));
+                }
                 symbols_out.set_next(flags, SymbolId::undefined(), file_id);
                 continue;
             }
 
             let resolution = symbol_id;
-
-            let local_index = symbol_id.offset_from(base_symbol_id);
 
             if symbol.is_local() {
                 symbols_out.set_next(flags, resolution, file_id);
@@ -2083,6 +2124,10 @@ impl<'data> SymbolLoadOutputs<'data> {
         self.pending_symbols_by_bucket[pending.name.hash() as usize % num_buckets]
             .versioned_symbols
             .push(pending);
+    }
+
+    fn add_hidden_undefined_name(&mut self, name: PreHashed<UnversionedSymbolName<'data>>) {
+        self.hidden_undefined_names.push(name);
     }
 }
 
