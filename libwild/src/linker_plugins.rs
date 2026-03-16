@@ -375,7 +375,13 @@ impl LoadedPlugin {
             register_all_symbols_read_hook,
         ));
         transfer_vector.push(LdPluginTv::fn_ptr6(Tag::GetApiVersion, get_api_version));
-        transfer_vector.push(LdPluginTv::fn_ptr2(Tag::Message, message));
+        // Message callback: register the C shim that handles variadic arguments.
+        // We can't use fn_ptr2 directly because plugin_message_impl is variadic,
+        // so we manually construct the transfer vector entry.
+        transfer_vector.push(LdPluginTv {
+            tag: Tag::Message as u32,
+            value: plugin_message_impl as *const extern "C" fn(libc::c_int, *const libc::c_char) as usize,
+        });
         transfer_vector.push(LdPluginTv::fn_ptr3(Tag::AddSymbols, add_symbols));
         transfer_vector.push(LdPluginTv::fn_ptr3(Tag::AddSymbolsV2, add_symbols));
         transfer_vector.push(LdPluginTv::fn_ptr3(Tag::GetSymbolsV3, get_symbols_v3));
@@ -985,22 +991,30 @@ extern "C" fn add_input_library(lib_name: *const libc::c_char) -> Status {
     Status::Ok
 }
 
-/// This function is called when the plugin wants to emit a message. It's supposed to accept varargs
-/// similar to printf. Unfortunately that's not exactly easy for us to do, so we just report the
-/// format string.
-extern "C" fn message(level: libc::c_int, format: *const libc::c_char) -> Status {
+// FFI binding to the C shim that handles variadic message formatting
+#[link(name = "plugin_message_shim", kind = "static")]
+unsafe extern "C" {
+    /// C shim function that accepts variadic arguments and formats them using vsnprintf.
+    /// This function then calls back into Rust via plugin_message_handler.
+    fn plugin_message_impl(level: libc::c_int, format: *const libc::c_char, ...) -> Status;
+}
+
+/// This is called by the C shim after formatting the message with variadic arguments.
+#[allow(dead_code)]
+#[unsafe(no_mangle)]
+extern "C" fn plugin_message_handler(level: libc::c_int, formatted: *const libc::c_char) -> Status {
     catch_panics(|| {
         let Some(level) = MessageLevel::from_raw(level) else {
             return Status::Err;
         };
 
-        let format = unsafe { CStr::from_ptr(format) };
+        let formatted = unsafe { CStr::from_ptr(formatted) };
 
         if level == MessageLevel::Error || level == MessageLevel::Fatal {
-            println!("Linker plugin {level}: {}", format.to_string_lossy());
-            ERROR_MESSAGE.replace(Some(format.to_string_lossy().to_string()));
+            println!("Linker plugin {level}: {}", formatted.to_string_lossy());
+            ERROR_MESSAGE.replace(Some(formatted.to_string_lossy().to_string()));
         } else {
-            println!("Linker plugin {level}: {}", format.to_string_lossy());
+            println!("Linker plugin {level}: {}", formatted.to_string_lossy());
         }
 
         Status::Ok

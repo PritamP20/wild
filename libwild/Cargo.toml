@@ -73,5 +73,8 @@ perfetto = ["perfetto-recorder/enable", "tracing/release_max_level_info"]
 # Enable work-in-progress features
 wip = []
 
+[build-dependencies]
+cc = { workspace = true }
+
 [lints]
 workspace = true

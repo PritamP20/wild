@@ -32,6 +32,7 @@ bitflags = "2.4.0"
 blake3 = { version = "1.0.0", features = ["rayon"] }
 bumpalo-herd = "0.1.2"
 bytesize = "2.0.0"
+cc = "1.0"
 clap = { version = "4.1.0", features = ["derive"] }
 colored = "3.0.0"
 colosseum = "0.2.2"
